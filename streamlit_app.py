@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# OLX x FIPE — v5.1 (orçamento + margem; modelo/estado/cidade opcionais; robusto)
+# OLX x FIPE — v5.2 (orçamento + margem; modelo/estado/cidade opcionais; robusto com fallback)
 
 import re
 import csv
@@ -59,6 +59,7 @@ BASE_HDRS = {
     'Connection': 'keep-alive',
     'Cache-Control': 'no-cache',
     'Pragma': 'no-cache',
+    'Referer': 'https://www.olx.com.br/',
 }
 
 def parse_preco(texto: str):
@@ -133,7 +134,42 @@ def montar_url(budget: float, tol_preco_val: float, modelo: str = '', estado: st
         params += f'&o={page}'
     return base + path + params
 
-def fetch(url: str, retries: int = 2, backoff: float = 1.2):
+def _call_scraping_provider(url: str, headers: dict):
+    """Se houver chaves em st.secrets, usa ScraperAPI ou ScrapingBee para contornar 403."""
+    providers = []
+    key_scraperapi = st.secrets.get('SCRAPERAPI_KEY', None)
+    key_scrapingbee = st.secrets.get('SCRAPINGBEE_KEY', None)
+    if key_scraperapi:
+        providers.append(('scraperapi', key_scraperapi))
+    if key_scrapingbee:
+        providers.append(('scrapingbee', key_scrapingbee))
+    for name, key in providers:
+        try:
+            if name == 'scraperapi':
+                api_url = 'http://api.scraperapi.com'
+                params = {
+                    'api_key': key,
+                    'url': url,
+                    'keep_headers': 'true',
+                    'country_code': 'br',
+                }
+                r = requests.get(api_url, params=params, headers=headers, timeout=35)
+            else:
+                api_url = 'https://app.scrapingbee.com/api/v1/'
+                params = {
+                    'api_key': key,
+                    'url': url,
+                    'country_code': 'br',
+                    'block_ads': 'true',
+                }
+                r = requests.get(api_url, params=params, headers=headers, timeout=35)
+            r.raise_for_status()
+            return r.text
+        except Exception:
+            continue
+    return None  # nenhum provedor funcionou
+
+def fetch(url: str, retries: int = 1, backoff: float = 1.2):
     last_err = None
     for i in range(retries + 1):
         try:
@@ -142,13 +178,21 @@ def fetch(url: str, retries: int = 2, backoff: float = 1.2):
             res = requests.get(url, headers=hdrs, timeout=25)
             res.raise_for_status()
             return res.text
+        except requests.exceptions.HTTPError as e:
+            # se 403, tenta via provedor de scraping (se chave estiver configurada)
+            status = getattr(e.response, 'status_code', None)
+            if status == 403:
+                html = _call_scraping_provider(url, hdrs)
+                if html:
+                    return html
+            last_err = e
         except Exception as e:
             last_err = e
-            time.sleep(backoff * (i + 1))
+        time.sleep(backoff * (i + 1))
     raise last_err
 
 # ---------------------------
-# Estimativa de FIPE (API Parallelum) — heurística por título/ano
+# Estimativa de FIPE (API Parallelum)
 # ---------------------------
 FIPE_BASE = 'https://parallelum.com.br/fipe/api/v1/carros'
 COMMON_BRAND_ALIASES = {
@@ -292,7 +336,12 @@ def human_money(v):
         return '—'
     return ('R$ {:,.2f}'.format(v)).replace(',', 'X').replace('.', ',').replace('X', '.')
 
-# Link útil para verificar como a OLX está respondendo na página 1
+# ---------------------------
+# Links base/ajuda e alerta cidade/estado
+# ---------------------------
+if cidade and not estado:
+    st.warning('Para filtrar por cidade, preencha também o estado (ex.: estado=minas-gerais e cidade=montes-claros).')
+
 base_url = montar_url(budget, tol_preco, modelo, estado or None, cidade or None, 1)
 st.markdown(f'🔗 **Página base da OLX (página 1):** [{base_url}]({base_url})')
 
@@ -304,8 +353,10 @@ if buscar:
     progress = st.progress(0.0, text='Coletando páginas...')
     log = st.empty()
 
+    search_links = []  # sempre mostramos os links, para abrir no navegador se a OLX bloquear o servidor
     for p in range(1, max_pages + 1):
         url = montar_url(budget, tol_preco, modelo, estado or None, cidade or None, p)
+        search_links.append(url)
         log.write(f'Buscando página {p}/{max_pages}: {url}')
         try:
             html = fetch(url)
@@ -318,9 +369,15 @@ if buscar:
         time.sleep(0.6)  # suaviza frequência para evitar bloqueios
         progress.progress(p / max_pages)
 
+    # Mostra os links de busca gerados (úteis se houver bloqueio 403)
+    with st.expander('Links diretos das páginas de busca geradas'):
+        for u in search_links:
+            st.markdown(f'- {u}')
+
     if not all_rows:
-        st.warning('Nenhum anúncio coletado. A OLX pode estar limitando acessos. '
-                   'Tente reduzir páginas, mudar filtros ou rode localmente.')
+        st.error('Nenhum anúncio coletado. A OLX pode estar limitando acessos do servidor.\n'
+                 'Abra os links acima no seu navegador (funciona normalmente) ou configure uma chave em `st.secrets`:\n'
+                 '- `SCRAPERAPI_KEY` (ScraperAPI) ou `SCRAPINGBEE_KEY` (ScrapingBee).')
         st.stop()
 
     df = pd.DataFrame(all_rows)
@@ -385,6 +442,11 @@ if buscar:
         'margem_calc': 'Margem (FIPE − Preço)',
         'url': 'Anúncio',
     }, inplace=True)
+
+    def human_money(v):
+        if v is None:
+            return '—'
+        return ('R$ {:,.2f}'.format(v)).replace(',', 'X').replace('.', ',').replace('X', '.')
 
     df_show['Preço (R$)'] = df_show['Preço (R$)'].apply(human_money)
     df_show['FIPE estimada (R$)'] = df_show['FIPE estimada (R$)'].apply(human_money)
