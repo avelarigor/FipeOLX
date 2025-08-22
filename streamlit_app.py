@@ -1,5 +1,12 @@
 # -*- coding: utf-8 -*-
-# OLX x FIPE — v5.2 (orçamento + margem; modelo/estado/cidade opcionais; robusto com fallback)
+# OLX x FIPE — v5.3
+# - Orçamento + margem alvo (com tolerâncias)
+# - Modelo/Estado/Cidade opcionais
+# - Fallback contra 403:
+#     * Provedores opcionais via st.secrets (SCRAPERAPI_KEY / SCRAPINGBEE_KEY)
+#     * Novo modo "Importar HTML": você abre a busca no seu navegador e envia os .html no app
+# - Estimativa de FIPE (API Parallelum) por heurística (título/ano)
+# - Ranking por proximidade de margem e de preço
 
 import re
 import csv
@@ -37,13 +44,11 @@ with st.sidebar:
     max_pages = st.slider('Páginas a varrer', min_value=1, max_value=5, value=3,
                           help='Quantidade de páginas de resultados da OLX a coletar (parâmetro &o=)')
     only_with_price = st.checkbox('Apenas anúncios com preço', value=True)
-    buscar = st.button('🔎 Buscar anúncios', type='primary')
 
-st.markdown(
-    'Coletamos anúncios da OLX na faixa do seu orçamento (filtros `ps`/`pe`), '
-    'estimamos a **FIPE** por heurística (título/ano, API pública) e calculamos a **margem (FIPE − preço)**. '
-    'Ranqueamos pela proximidade da margem desejada e, em seguida, do preço ao seu orçamento.'
-)
+# ---------------------------
+# Modo de operação
+# ---------------------------
+tab_busca, tab_import = st.tabs(['Buscar online (automático)', 'Importar HTML (manual, sem 403)'])
 
 # ---------------------------
 # Utilidades de scraping
@@ -179,7 +184,6 @@ def fetch(url: str, retries: int = 1, backoff: float = 1.2):
             res.raise_for_status()
             return res.text
         except requests.exceptions.HTTPError as e:
-            # se 403, tenta via provedor de scraping (se chave estiver configurada)
             status = getattr(e.response, 'status_code', None)
             if status == 403:
                 html = _call_scraping_provider(url, hdrs)
@@ -192,7 +196,7 @@ def fetch(url: str, retries: int = 1, backoff: float = 1.2):
     raise last_err
 
 # ---------------------------
-# Estimativa de FIPE (API Parallelum)
+# Estimativa de FIPE (API Parallelum) — heurística por título/ano
 # ---------------------------
 FIPE_BASE = 'https://parallelum.com.br/fipe/api/v1/carros'
 COMMON_BRAND_ALIASES = {
@@ -337,7 +341,7 @@ def human_money(v):
     return ('R$ {:,.2f}'.format(v)).replace(',', 'X').replace('.', ',').replace('X', '.')
 
 # ---------------------------
-# Links base/ajuda e alerta cidade/estado
+# Ajuda cidade/estado e link base
 # ---------------------------
 if cidade and not estado:
     st.warning('Para filtrar por cidade, preencha também o estado (ex.: estado=minas-gerais e cidade=montes-claros).')
@@ -346,46 +350,73 @@ base_url = montar_url(budget, tol_preco, modelo, estado or None, cidade or None,
 st.markdown(f'🔗 **Página base da OLX (página 1):** [{base_url}]({base_url})')
 
 # ---------------------------
-# Execução da busca
+# TAB 1 — Buscar online (automático)
 # ---------------------------
-if buscar:
-    all_rows = []
-    progress = st.progress(0.0, text='Coletando páginas...')
-    log = st.empty()
+with tab_busca:
+    if st.button('🔎 Buscar anúncios (online)'):
+        all_rows = []
+        progress = st.progress(0.0, text='Coletando páginas...')
+        log = st.empty()
 
-    search_links = []  # sempre mostramos os links, para abrir no navegador se a OLX bloquear o servidor
-    for p in range(1, max_pages + 1):
-        url = montar_url(budget, tol_preco, modelo, estado or None, cidade or None, p)
-        search_links.append(url)
-        log.write(f'Buscando página {p}/{max_pages}: {url}')
-        try:
-            html = fetch(url)
-        except Exception as e:
-            st.warning(f'Falha ao buscar página {p}: {e}')
+        search_links = []
+        for p in range(1, max_pages + 1):
+            url = montar_url(budget, tol_preco, modelo, estado or None, cidade or None, p)
+            search_links.append(url)
+            log.write(f'Buscando página {p}/{max_pages}: {url}')
+            try:
+                html = fetch(url)
+            except Exception as e:
+                st.warning(f'Falha ao buscar página {p}: {e}')
+                progress.progress(p / max_pages)
+                continue
+            rows = extrair_anuncios(html)
+            all_rows.extend(rows)
+            time.sleep(0.6)
             progress.progress(p / max_pages)
-            continue
-        rows = extrair_anuncios(html)
-        all_rows.extend(rows)
-        time.sleep(0.6)  # suaviza frequência para evitar bloqueios
-        progress.progress(p / max_pages)
 
-    # Mostra os links de busca gerados (úteis se houver bloqueio 403)
-    with st.expander('Links diretos das páginas de busca geradas'):
-        for u in search_links:
-            st.markdown(f'- {u}')
+        with st.expander('Links diretos das páginas de busca geradas'):
+            for u in search_links:
+                st.markdown(f'- {u}')
 
-    if not all_rows:
-        st.error('Nenhum anúncio coletado. A OLX pode estar limitando acessos do servidor.\n'
-                 'Abra os links acima no seu navegador (funciona normalmente) ou configure uma chave em `st.secrets`:\n'
-                 '- `SCRAPERAPI_KEY` (ScraperAPI) ou `SCRAPINGBEE_KEY` (ScrapingBee).')
-        st.stop()
+        if not all_rows:
+            st.error('Nenhum anúncio coletado. A OLX pode estar limitando acessos do servidor.\n'
+                     'Abra os links acima no seu navegador (funciona) **ou** use a aba "Importar HTML".')
+        else:
+            st.session_state['rows_online'] = all_rows
 
-    df = pd.DataFrame(all_rows)
+# ---------------------------
+# TAB 2 — Importar HTML (manual, sem 403)
+# ---------------------------
+with tab_import:
+    st.write('Abra a página de busca no seu **navegador** (com seus filtros) e salve o HTML: '
+             'Ctrl+S → "Página da Web, somente HTML" (.html). Faça isso para **1 ou mais páginas** (paginação &o=2, &o=3...). '
+             'Depois envie os arquivos abaixo.')
+    files = st.file_uploader('Envie um ou mais arquivos .html das páginas da OLX', type=['html', 'htm'], accept_multiple_files=True)
+    if files and st.button('📥 Importar anúncios dos HTMLs'):
+        imported = []
+        for f in files:
+            try:
+                html = f.read().decode('utf-8', errors='ignore')
+                imported.extend(extrair_anuncios(html))
+            except Exception as e:
+                st.warning(f'Falha ao ler {f.name}: {e}')
+        if not imported:
+            st.error('Não foi possível extrair anúncios dos arquivos enviados.')
+        else:
+            st.success(f'Importados {len(imported)} anúncios a partir de {len(files)} arquivo(s).')
+            st.session_state['rows_online'] = imported
+
+# ---------------------------
+# PÓS-COLETA (comum aos dois modos)
+# ---------------------------
+rows = st.session_state.get('rows_online', [])
+if rows:
+    df = pd.DataFrame(rows).drop_duplicates(subset=['url'])
     for col in ['titulo', 'preco_txt', 'preco_num', 'url']:
         if col not in df.columns:
             df[col] = None
 
-    # filtro de preço (reforça a faixa além do filtro da própria OLX)
+    # reforça a faixa de preço
     min_p = max(0, int(budget - tol_preco))
     max_p = int(budget + tol_preco)
     if only_with_price:
@@ -394,85 +425,81 @@ if buscar:
 
     if df.empty:
         st.info('Nenhum anúncio na faixa de preço após filtros.')
-        st.stop()
+    else:
+        # Estima FIPE
+        st.info('Estimando FIPE por título/ano (heurística, pode levar alguns segundos)...')
+        fipe_vals = []
+        for t in df['titulo'].fillna('').tolist():
+            try:
+                fipe_val = estimate_fipe_from_title(t)
+            except Exception:
+                fipe_val = None
+            fipe_vals.append(fipe_val)
+            time.sleep(0.2)
+        df['fipe_estimado'] = fipe_vals
 
-    # estima FIPE para cada anúncio
-    st.info('Estimando FIPE por título/ano (heurística, pode levar alguns segundos)...')
-    fipe_vals = []
-    for t in df['titulo'].fillna('').tolist():
-        try:
-            fipe_val = estimate_fipe_from_title(t)
-        except Exception:
-            fipe_val = None
-        fipe_vals.append(fipe_val)
-        time.sleep(0.2)  # evita rate limit da API pública
-    df['fipe_estimado'] = fipe_vals
+        # Calcula margem
+        df['margem_calc'] = df.apply(
+            lambda r: (r['fipe_estimado'] - r['preco_num']) if pd.notna(r['fipe_estimado']) and pd.notna(r['preco_num']) else None,
+            axis=1
+        )
 
-    # calcula margem
-    df['margem_calc'] = df.apply(
-        lambda r: (r['fipe_estimado'] - r['preco_num']) if pd.notna(r['fipe_estimado']) and pd.notna(r['preco_num']) else None,
-        axis=1
-    )
+        # Seleção pela margem ~ alvo
+        alvo_min = margem_alvo - tol_margem
+        alvo_max = margem_alvo + tol_margem
+        mask_margem = df['margem_calc'].notna() & df['margem_calc'].between(alvo_min, alvo_max)
+        df_sel = df[mask_margem].copy()
 
-    # seleção por margem ~ desejada (com tolerância)
-    alvo_min = margem_alvo - tol_margem
-    alvo_max = margem_alvo + tol_margem
-    mask_margem = df['margem_calc'].notna() & df['margem_calc'].between(alvo_min, alvo_max)
-    df_sel = df[mask_margem].copy()
+        if df_sel.empty:
+            st.warning('Nenhum anúncio dentro da faixa de margem; exibindo anúncios com FIPE estimada para avaliação.')
+            df_sel = df[df['fipe_estimado'].notna()].copy()
 
-    if df_sel.empty:
-        st.warning('Nenhum anúncio dentro da faixa de margem; exibindo anúncios com FIPE estimada para avaliação.')
-        df_sel = df[df['fipe_estimado'].notna()].copy()
+        if df_sel.empty:
+            st.info('Sem FIPE estimada suficiente para cálculo de margem.')
+        else:
+            df_sel['delta_margem'] = (df_sel['margem_calc'] - margem_alvo).abs()
+            df_sel['delta_preco'] = (df_sel['preco_num'] - budget).abs()
+            df_sel = df_sel.sort_values(['delta_margem', 'delta_preco']).reset_index(drop=True)
 
-    if df_sel.empty:
-        st.info('Sem FIPE estimada suficiente para cálculo de margem.')
-        st.stop()
+            df_show = df_sel[['titulo', 'preco_num', 'fipe_estimado', 'margem_calc', 'url']].copy()
+            df_show.rename(columns={
+                'titulo': 'Título',
+                'preco_num': 'Preço (R$)',
+                'fipe_estimado': 'FIPE estimada (R$)',
+                'margem_calc': 'Margem (FIPE − Preço)',
+                'url': 'Anúncio',
+            }, inplace=True)
 
-    # ranking: margem mais próxima do alvo, depois preço mais próximo do orçamento
-    df_sel['delta_margem'] = (df_sel['margem_calc'] - margem_alvo).abs()
-    df_sel['delta_preco'] = (df_sel['preco_num'] - budget).abs()
-    df_sel = df_sel.sort_values(['delta_margem', 'delta_preco']).reset_index(drop=True)
+            def fmt_money(v):
+                if v is None:
+                    return '—'
+                return ('R$ {:,.2f}'.format(v)).replace(',', 'X').replace('.', ',').replace('X', '.')
 
-    # exibição
-    df_show = df_sel[['titulo', 'preco_num', 'fipe_estimado', 'margem_calc', 'url']].copy()
-    df_show.rename(columns={
-        'titulo': 'Título',
-        'preco_num': 'Preço (R$)',
-        'fipe_estimado': 'FIPE estimada (R$)',
-        'margem_calc': 'Margem (FIPE − Preço)',
-        'url': 'Anúncio',
-    }, inplace=True)
+            df_show['Preço (R$)'] = df_show['Preço (R$)'].apply(fmt_money)
+            df_show['FIPE estimada (R$)'] = df_show['FIPE estimada (R$)'].apply(fmt_money)
+            df_show['Margem (FIPE − Preço)'] = df_show['Margem (FIPE − Preço)'].apply(fmt_money)
 
-    def human_money(v):
-        if v is None:
-            return '—'
-        return ('R$ {:,.2f}'.format(v)).replace(',', 'X').replace('.', ',').replace('X', '.')
+            colcfg = {}
+            try:
+                colcfg['Anúncio'] = st.column_config.LinkColumn('Anúncio')
+            except Exception:
+                pass
 
-    df_show['Preço (R$)'] = df_show['Preço (R$)'].apply(human_money)
-    df_show['FIPE estimada (R$)'] = df_show['FIPE estimada (R$)'].apply(human_money)
-    df_show['Margem (FIPE − Preço)'] = df_show['Margem (FIPE − Preço)'].apply(human_money)
+            st.subheader(f'Resultados ({len(df_show)})')
+            st.dataframe(df_show, use_container_width=True, column_config=colcfg, hide_index=True)
 
-    colcfg = {}
-    try:
-        colcfg['Anúncio'] = st.column_config.LinkColumn('Anúncio')
-    except Exception:
-        pass
-
-    st.subheader(f'Resultados ({len(df_show)})')
-    st.dataframe(df_show, use_container_width=True, column_config=colcfg, hide_index=True)
-
-    # CSV com valores numéricos crus (separador ';' para Excel BR)
-    out = df_sel[['titulo', 'preco_num', 'fipe_estimado', 'margem_calc', 'url']].copy()
-    csv_io = StringIO()
-    writer = csv.writer(csv_io, delimiter=';')
-    writer.writerow(['titulo', 'preco_num', 'fipe_estimado', 'margem_calc', 'url'])
-    for _, r in out.iterrows():
-        writer.writerow([
-            r.get('titulo', ''),
-            r.get('preco_num', ''),
-            r.get('fipe_estimado', ''),
-            r.get('margem_calc', ''),
-            r.get('url', ''),
-        ])
-    st.download_button('⬇️ Baixar CSV (valores numéricos)', data=csv_io.getvalue().encode('utf-8'),
-                       file_name='olx_busca_orcamento_margem.csv', mime='text/csv')
+            # CSV com valores numéricos crus
+            out = df_sel[['titulo', 'preco_num', 'fipe_estimado', 'margem_calc', 'url']].copy()
+            csv_io = StringIO()
+            writer = csv.writer(csv_io, delimiter=';')
+            writer.writerow(['titulo', 'preco_num', 'fipe_estimado', 'margem_calc', 'url'])
+            for _, r in out.iterrows():
+                writer.writerow([
+                    r.get('titulo', ''),
+                    r.get('preco_num', ''),
+                    r.get('fipe_estimado', ''),
+                    r.get('margem_calc', ''),
+                    r.get('url', ''),
+                ])
+            st.download_button('⬇️ Baixar CSV (valores numéricos)', data=csv_io.getvalue().encode('utf-8'),
+                               file_name='olx_busca_orcamento_margem.csv', mime='text/csv')
