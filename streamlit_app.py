@@ -1,18 +1,26 @@
 # -*- coding: utf-8 -*-
-# OLX x FIPE — v6.0
-# - Orçamento + margem alvo (com tolerâncias)
+# OLX x FIPE — v6.1
+# - Busca por orçamento (ps/pe) + margem desejada (com tolerância)
 # - Modelo/Estado/Cidade opcionais
-# - 2 modos: Buscar online (com provedores via st.secrets) e Importar HTML (sem 403)
-# - Importar HTML lê __NEXT_DATA__.props.pageProps.ads (formato que veio nos seus arquivos)
+# - 2 modos: Buscar online (c/ fallback via Secrets) e Importar HTML (lê __NEXT_DATA__)
+# - Import mais robusto: BeautifulSoup, regex padrão e fallback "window.__NEXT_DATA__ = { ... }"
 # - Ranking por proximidade da margem e depois do preço
+# - Título exibe a versão (confere se atualizou mesmo)
 
 import re, json, time, math, unicodedata, urllib.parse as up
 from functools import lru_cache
-import requests, pandas as pd, streamlit as st
+from typing import Any, Dict, List
 
-# ---------------------------
-# Utils
-# ---------------------------
+import requests
+import pandas as pd
+import streamlit as st
+from bs4 import BeautifulSoup
+
+VERSION = "v6.1"
+
+# =========================
+# Utilidades
+# =========================
 def norm_txt(s: str) -> str:
     if not s: return ""
     s = unicodedata.normalize("NFKD", str(s)).encode("ascii", "ignore").decode("ascii")
@@ -42,19 +50,20 @@ UA_POOL = [
 
 def http_get(url, timeout=40):
     headers = {"User-Agent": UA_POOL[int(time.time()) % len(UA_POOL)]}
-    if "SCRAPERAPI_KEY" in st.secrets:  # opcional
+    # provedores (opcional) — cole as chaves em Settings → Secrets no Streamlit Cloud
+    if "SCRAPERAPI_KEY" in st.secrets:
         key = st.secrets["SCRAPERAPI_KEY"]
         proxy = f"https://api.scraperapi.com?api_key={key}&keep_headers=true&url={up.quote(url)}"
         return requests.get(proxy, timeout=timeout, headers=headers)
-    if "SCRAPINGBEE_KEY" in st.secrets:  # opcional
+    if "SCRAPINGBEE_KEY" in st.secrets:
         key = st.secrets["SCRAPINGBEE_KEY"]
         proxy = f"https://app.scrapingbee.com/api/v1/?api_key={key}&render_js=false&url={up.quote(url)}"
         return requests.get(proxy, timeout=timeout, headers=headers)
     return requests.get(url, timeout=timeout, headers=headers)
 
-# ---------------------------
+# =========================
 # FIPE (Parallelum)
-# ---------------------------
+# =========================
 FIPE_BASE = "https://parallelum.com.br/fipe/api/v1"
 
 @lru_cache(maxsize=256)
@@ -106,9 +115,9 @@ def get_fipe_price_guess(brand, model, year):
     except Exception:
         return None
 
-# ---------------------------
+# =========================
 # OLX URLs
-# ---------------------------
+# =========================
 def olx_base_url(valor, tol_preco, estado=None, cidade=None, modelo=None):
     ps, pe = max(0, int(valor - tol_preco)), int(valor + tol_preco)
     path = "/autos-e-pecas/carros-vans-e-utilitarios"
@@ -126,17 +135,63 @@ def list_search_pages(base_url, pages=1):
         urls.append(f"{base_url}{sep}o={i}")
     return urls
 
-# ---------------------------
-# Importadores
-# ---------------------------
-def parse_next_data_from_html(html_text):
-    m = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', html_text, flags=re.DOTALL)
-    if not m: return None
-    try: return json.loads(m.group(1))
-    except Exception: return None
+# =========================
+# Importadores — lê __NEXT_DATA__
+# =========================
+NEXT_ID_RE = re.compile(r'<script[^>]+id=["\']__NEXT_DATA__["\'][^>]*>(.*?)</script>', re.DOTALL | re.IGNORECASE)
+WINDOW_NEXT_RE = re.compile(r'__NEXT_DATA__\s*=\s*({.*?})\s*[,;]?', re.DOTALL)
 
-def ads_from_next_data(nd):
-    return (nd or {}).get("props", {}).get("pageProps", {}).get("ads", []) or []
+def parse_next_data_from_html(html_text: str) -> Dict[str, Any] | None:
+    # 1) tente via BeautifulSoup
+    try:
+        soup = BeautifulSoup(html_text, "html.parser")
+        s = soup.find("script", id="__NEXT_DATA__")
+        if s and (s.string or s.get_text()):
+            txt = s.string or s.get_text()
+            return json.loads(txt)
+    except Exception:
+        pass
+    # 2) regex padrão <script id="__NEXT_DATA__">...</script>
+    m = NEXT_ID_RE.search(html_text)
+    if m:
+        try:
+            return json.loads(m.group(1))
+        except Exception:
+            pass
+    # 3) fallback: window.__NEXT_DATA__ = {...}
+    m2 = WINDOW_NEXT_RE.search(html_text)
+    if m2:
+        try:
+            return json.loads(m2.group(1))
+        except Exception:
+            pass
+    return None
+
+def walk_json(obj):
+    if isinstance(obj, dict):
+        yield obj
+        for v in obj.values():
+            yield from walk_json(v)
+    elif isinstance(obj, list):
+        for x in obj:
+            yield from walk_json(x)
+
+def ads_from_next_data(nd: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Extrai anúncios. Primeiro tenta props.pageProps.ads, depois procura objetos com 'friendlyUrl' ou 'subject'."""
+    if not nd: return []
+    # caminho oficial da listagem
+    ads = (nd.get("props", {}).get("pageProps", {}).get("ads") or [])
+    if ads: return ads
+    # fallback: varre JSON procurando objetos com cara de anúncio
+    found = []
+    for d in walk_json(nd):
+        if not isinstance(d, dict): continue
+        has_title = isinstance(d.get("subject") or d.get("title"), str)
+        has_url   = isinstance(d.get("friendlyUrl") or d.get("url"), str)
+        has_price = (d.get("priceValue") is not None) or (d.get("price") is not None)
+        if (has_title and has_url) or (has_url and has_price):
+            found.append(d)
+    return found
 
 def collect_ads_online(base_url, pages):
     ads, errs = [], []
@@ -147,7 +202,7 @@ def collect_ads_online(base_url, pages):
             nd = parse_next_data_from_html(r.text)
             page_ads = ads_from_next_data(nd)
             if not page_ads:
-                errs.append(f"Página {i}: nenhum anúncio no __NEXT_DATA__ (pode ser bloqueio/403 render-side).")
+                errs.append(f"Página {i}: não encontrei anúncios no __NEXT_DATA__ (pode ser 403 render-side).")
             ads.extend(page_ads)
         except Exception as e:
             errs.append(f"Página {i}: {e}")
@@ -172,7 +227,7 @@ def ad_to_row(ad):
     price_txt = ad.get("priceValue") or ad.get("price") or ""
     price_num = parse_brl_to_int(price_txt)
 
-    props = {p.get("name"): p.get("value") for p in (ad.get("properties") or [])}
+    props = {p.get("name"): p.get("value") for p in (ad.get("properties") or []) if isinstance(p, dict)}
     brand = props.get("vehicle_brand") or props.get("brand") or ""
     model = props.get("vehicle_model") or props.get("model") or ""
     year  = props.get("regdate") or props.get("year") or ""
@@ -230,13 +285,15 @@ def show_results(df: pd.DataFrame):
     st.success(f"Encontrados {len(out)} anúncios (ordenado por proximidade da margem e do preço).")
     st.dataframe(out, use_container_width=True)
 
-# ---------------------------
+# =========================
 # UI
-# ---------------------------
-st.set_page_config(page_title="Busca OLX por Valor + Margem FIPE", layout="wide")
-st.title("🚗 Busca OLX por Valor a Investir + Margem FIPE")
+# =========================
+st.set_page_config(page_title=f"Busca OLX por Valor + Margem FIPE ({VERSION})", layout="wide")
+st.title(f"🚗 Busca OLX por Valor a Investir + Margem FIPE — {VERSION}")
+
 st.write("Informe seu **orçamento** e a **margem desejada**. Buscamos na OLX pela faixa de preço (ps/pe), "
-         "estimamos a FIPE (API pública) e calculamos a margem (FIPE − preço).")
+         "estimamos a FIPE (API pública) e calculamos **margem = FIPE − preço**. "
+         "Ranqueamos pela proximidade da margem e, depois, do preço.")
 
 with st.sidebar:
     st.header("Parâmetros")
@@ -247,7 +304,7 @@ with st.sidebar:
     modelo = st.text_input("Modelo (opcional, ex.: Gol 2014)", "")
     estado = st.text_input("Estado (opcional, ex.: minas-gerais)", "")
     cidade = st.text_input("Cidade (opcional, ex.: montes-claros)", "")
-    pages = st.slider("Páginas a varrer", 1, 5, 2, help="Quantidade de páginas (&o=2, &o=3…).")
+    pages = st.slider("Páginas a varrer", 1, 5, 2, help="Paginação da OLX (&o=2, &o=3…).")
     only_with_price = st.checkbox("Apenas anúncios com preço numérico", True)
 
 tab1, tab2 = st.tabs(["Buscar online (automático)", "Importar HTML (manual, sem 403)"])
@@ -264,8 +321,8 @@ with tab1:
         df = filter_rank(rows, valor, margem_desejada, tol_preco, tol_margem, only_price=only_with_price)
         if df.empty: st.error("Nenhum anúncio encontrado.")
         else: show_results(df)
-        st.caption("Se der **403/Forbidden**, use a aba Importar HTML ou configure um provedor em **Settings → Secrets** "
-                   "(`SCRAPERAPI_KEY` ou `SCRAPINGBEE_KEY`).")
+        st.caption("Se der **403/Forbidden**, use a aba Importar HTML ou configure em **Settings → Secrets**: "
+                   "`SCRAPERAPI_KEY` ou `SCRAPINGBEE_KEY`.")
 
 # -------- Import
 with tab2:
@@ -278,5 +335,5 @@ with tab2:
         rows = [ad_to_row(a) for a in ads]
         rows = enrich_with_fipe(rows, want=True)
         df = filter_rank(rows, valor, margem_desejada, tol_preco, tol_margem, only_price=only_with_price)
-        if df.empty: st.error("Não foi possível extrair anúncios (verifique se rolou até o fim e salvou como somente HTML).")
+        if df.empty: st.error("Não foi possível extrair anúncios (confira se rolou até o fim e salvou como somente HTML).")
         else: show_results(df)
