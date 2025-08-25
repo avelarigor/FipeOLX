@@ -81,4 +81,442 @@ def parse_preco(texto: str):
     except Exception:
         return None
 
-def _
+def _text(node):
+    try:
+        return node.get_text(" ", strip=True)
+    except Exception:
+        return ""
+
+def extrair_anuncios(html: str):
+    """Extrai {titulo, preco_txt, preco_num, url} com alto grau de tolerância."""
+    soup = BeautifulSoup(html, 'html.parser')
+    results = []
+
+    # 1) Seletores mais comuns (cards)
+    card_selectors = [
+        'a[data-ds-component="DS-AdCard"]',
+        'a[data-testid*="ad-card"]',
+        'a.sc-.*[href*="/d/"]',  # classes geradas
+        'a[href*="/d/"]',
+    ]
+    anchors = []
+    for sel in card_selectors:
+        try:
+            anchors.extend(soup.select(sel))
+        except Exception:
+            # seletor CSS inválido (regex-like) — ignore
+            pass
+
+    # Dedup de anchors
+    seen_a = set()
+    uniq_anchors = []
+    for a in anchors:
+        href = a.get('href')
+        if not href:
+            continue
+        if href in seen_a:
+            continue
+        seen_a.add(href)
+        uniq_anchors.append(a)
+
+    for a in uniq_anchors:
+        href = a.get('href')
+        url = urljoin(BASE_URL, href)  # normaliza relativos -> absolutos
+        if 'olx.com.br' not in url:
+            continue
+
+        # Título (prioriza atributo title, depois h2/h3, depois texto do link)
+        titulo = a.get('title')
+        if not titulo:
+            h = a.find('h2') or a.find('h3')
+            if h:
+                titulo = _text(h)
+        if not titulo:
+            titulo = _text(a)
+        if not titulo:
+            # tenta subir 1..2 níveis e pegar um heading
+            p = a.parent
+            for _ in range(2):
+                if not p:
+                    break
+                h = p.find('h2') or p.find('h3')
+                if h:
+                    titulo = _text(h)
+                    break
+                p = p.parent
+
+        # Preço — tenta vários lugares e, por fim, regex no texto do card/pai
+        preco_txt = None
+        # 1) elementos "clássicos"
+        for el in [
+            a.find(attrs={'data-ds-component': 'DS-Price'}),
+            a.find('span', string=re.compile(r'R\$\s*[\d\.\,]+')),
+            a.find('p', string=re.compile(r'R\$\s*[\d\.\,]+')),
+            a.find('h3', string=re.compile(r'R\$\s*[\d\.\,]+')),
+        ]:
+            if el:
+                preco_txt = _text(el)
+                break
+        # 2) busca no texto do link
+        if not preco_txt:
+            m = re.search(r'R\$\s*[\d\.\,]+', _text(a))
+            if m:
+                preco_txt = m.group(0)
+        # 3) busca no texto do pai (1..2 níveis)
+        if not preco_txt:
+            p = a.parent
+            for _ in range(2):
+                if not p:
+                    break
+                m = re.search(r'R\$\s*[\d\.\,]+', _text(p))
+                if m:
+                    preco_txt = m.group(0)
+                    break
+                p = p.parent
+
+        results.append({
+            'titulo': titulo.strip() if titulo else None,
+            'preco_txt': preco_txt,
+            'preco_num': parse_preco(preco_txt),
+            'url': url
+        })
+
+    # 2) Se nada foi capturado pelos anchors, tenta qualquer link para /d/ no documento
+    if not results:
+        for a in soup.find_all('a', href=True):
+            href = a['href']
+            if '/d/' not in href:
+                continue
+            url = urljoin(BASE_URL, href)
+            titulo = a.get('title') or _text(a)
+            m = re.search(r'R\$\s*[\d\.\,]+', _text(a) + " " + _text(a.parent) if a.parent else "")
+            preco_txt = m.group(0) if m else None
+            results.append({
+                'titulo': titulo.strip() if titulo else None,
+                'preco_txt': preco_txt,
+                'preco_num': parse_preco(preco_txt),
+                'url': url
+            })
+
+    # Dedup por URL
+    clean = []
+    seen = set()
+    for r in results:
+        u = r.get('url')
+        if not u or u in seen:
+            continue
+        seen.add(u)
+        # precisa pelo menos título ou preço
+        if r.get('titulo') or r.get('preco_txt'):
+            clean.append(r)
+    return clean
+
+def montar_url(budget: float, tol_preco_val: float, modelo: str = '', estado: str = None, cidade: str = None, page: int = 1):
+    base = f'{BASE_URL}/autos-e-pecas/carros-vans-e-utilitarios'
+    path = ''
+    if estado:
+        e = estado.strip().strip('/').lower().replace(' ', '-')
+        path += f'/{e}'
+        if cidade:
+            c = cidade.strip().strip('/').lower().replace(' ', '-')
+            path += f'/{c}'
+    ps = max(0, int(budget - tol_preco_val))
+    pe = int(budget + tol_preco_val)
+    params = f'?sf=1&ps={ps}&pe={pe}'
+    if modelo and modelo.strip():
+        params += f'&q={quote_plus(modelo.strip())}'
+    if page and page > 1:
+        params += f'&o={page}'
+    return base + path + params
+
+def _call_scraping_provider(url: str, headers: dict):
+    """Se houver chaves em st.secrets, usa ScraperAPI ou ScrapingBee para contornar 403."""
+    providers = []
+    key_scraperapi = st.secrets.get('SCRAPERAPI_KEY', None)
+    key_scrapingbee = st.secrets.get('SCRAPINGBEE_KEY', None)
+    if key_scraperapi:
+        providers.append(('scraperapi', key_scraperapi))
+    if key_scrapingbee:
+        providers.append(('scrapingbee', key_scrapingbee))
+    for name, key in providers:
+        try:
+            if name == 'scraperapi':
+                api_url = 'http://api.scraperapi.com'
+                params = {'api_key': key, 'url': url, 'keep_headers': 'true', 'country_code': 'br'}
+                r = requests.get(api_url, params=params, headers=headers, timeout=35)
+            else:
+                api_url = 'https://app.scrapingbee.com/api/v1/'
+                params = {'api_key': key, 'url': url, 'country_code': 'br', 'block_ads': 'true'}
+                r = requests.get(api_url, params=params, headers=headers, timeout=35)
+            r.raise_for_status()
+            return r.text
+        except Exception:
+            continue
+    return None
+
+def fetch(url: str, retries: int = 1, backoff: float = 1.2):
+    last_err = None
+    for i in range(retries + 1):
+        try:
+            hdrs = BASE_HDRS.copy()
+            hdrs['User-Agent'] = UA_LIST[i % len(UA_LIST)]
+            res = requests.get(url, headers=hdrs, timeout=25)
+            res.raise_for_status()
+            return res.text
+        except requests.exceptions.HTTPError as e:
+            status = getattr(e.response, 'status_code', None)
+            if status == 403:
+                html = _call_scraping_provider(url, hdrs)
+                if html:
+                    return html
+            last_err = e
+        except Exception as e:
+            last_err = e
+        time.sleep(backoff * (i + 1))
+    raise last_err
+
+# ---------------------------
+# Estimativa de FIPE (API Parallelum) — heurística
+# ---------------------------
+FIPE_BASE = 'https://parallelum.com.br/fipe/api/v1/carros'
+COMMON_BRAND_ALIASES = {
+    'vw': 'Volkswagen', 'gm': 'Chevrolet', 'chevy': 'Chevrolet',
+    'mercedes': 'Mercedes-Benz', 'merce': 'Mercedes-Benz', 'bmw': 'BMW',
+}
+
+@lru_cache(maxsize=1000)
+def get_brands():
+    r = requests.get(f'{FIPE_BASE}/marcas', timeout=20); r.raise_for_status(); return r.json()
+
+@lru_cache(maxsize=1000)
+def get_models(brand_code: str):
+    r = requests.get(f'{FIPE_BASE}/marcas/{brand_code}/modelos', timeout=20); r.raise_for_status()
+    return r.json().get('modelos', [])
+
+@lru_cache(maxsize=2000)
+def get_years(brand_code: str, model_code: str):
+    r = requests.get(f'{FIPE_BASE}/marcas/{brand_code}/modelos/{model_code}/anos', timeout=20); r.raise_for_status()
+    return r.json()
+
+@lru_cache(maxsize=5000)
+def get_price(brand_code: str, model_code: str, year_code: str):
+    r = requests.get(f'{FIPE_BASE}/marcas/{brand_code}/modelos/{model_code}/anos/{year_code}', timeout=20); r.raise_for_status()
+    return r.json().get('Valor')
+
+def parse_money_br(s: str):
+    if not s: return None
+    s = s.replace('R$', '').replace('.', '').replace(',', '.').strip()
+    try: return float(s)
+    except Exception: return None
+
+def try_extract_year(text: str):
+    if not text: return None
+    m = re.search(r'(19|20)\d{2}', text); return int(m.group(0)) if m else None
+
+def find_brand_in_title(title_low: str, brands):
+    for b in brands:
+        if b['nome'].lower() in title_low: return b
+    for alias, proper in COMMON_BRAND_ALIASES.items():
+        if f' {alias} ' in f' {title_low} ':
+            for b in brands:
+                if b['nome'].lower() == proper.lower(): return b
+    parts = title_low.split(); first = parts[0].capitalize() if parts else ''
+    names = [b['nome'] for b in brands]
+    guess = difflib.get_close_matches(first, names, n=1, cutoff=0.85)
+    if guess:
+        for b in brands:
+            if b['nome'] == guess[0]: return b
+    return None
+
+def estimate_fipe_from_title(title: str):
+    if not title: return None
+    title_low = title.lower()
+    try: brands = get_brands()
+    except Exception: return None
+    brand = find_brand_in_title(title_low, brands)
+    if not brand: return None
+    try: models = get_models(brand['codigo'])
+    except Exception: return None
+    model_names = [m['nome'] for m in models]
+    candidates = difflib.get_close_matches(title, model_names, n=4, cutoff=0.5)
+    year_num = try_extract_year(title)
+    for cand in candidates:
+        mdl = next((m for m in models if m['nome'] == cand), None)
+        if not mdl: continue
+        try: years = get_years(brand['codigo'], mdl['codigo'])
+        except Exception: continue
+        if not years: continue
+        # escolhe ano mais próximo (se detectou), senão o primeiro
+        year_choice = None
+        if year_num:
+            def year_of(code_name: str):
+                m = re.search(r'(19|20)\d{2}', code_name); return int(m.group(0)) if m else None
+            best_delta = 10**9
+            for y in years:
+                ynum = year_of(y.get('nome', ''))
+                if ynum is None: continue
+                d = abs(ynum - year_num)
+                if d < best_delta: best_delta = d; year_choice = y.get('codigo')
+            if not year_choice: year_choice = years[0].get('codigo')
+        else:
+            year_choice = years[0].get('codigo')
+        try:
+            price_txt = get_price(brand['codigo'], mdl['codigo'], year_choice)
+            price = parse_money_br(price_txt)
+            if price: return price
+        except Exception: continue
+    return None
+
+def human_money(v):
+    if v is None: return '—'
+    return ('R$ {:,.2f}'.format(v)).replace(',', 'X').replace('.', ',').replace('X', '.')
+
+# ---------------------------
+# Ajuda cidade/estado e link base
+# ---------------------------
+if cidade and not estado:
+    st.warning('Para filtrar por cidade, preencha também o estado (ex.: estado=minas-gerais e cidade=montes-claros).')
+
+base_url = montar_url(budget, tol_preco, modelo, estado or None, cidade or None, 1)
+st.markdown(f'🔗 **Página base da OLX (página 1):** [{base_url}]({base_url})')
+
+# ---------------------------
+# TAB 1 — Buscar online (automático)
+# ---------------------------
+with tab_busca:
+    if st.button('🔎 Buscar anúncios (online)'):
+        all_rows = []
+        progress = st.progress(0.0, text='Coletando páginas...')
+        log = st.empty()
+        search_links = []
+        for p in range(1, max_pages + 1):
+            url = montar_url(budget, tol_preco, modelo, estado or None, cidade or None, p)
+            search_links.append(url)
+            log.write(f'Buscando página {p}/{max_pages}: {url}')
+            try:
+                html = fetch(url)
+            except Exception as e:
+                st.warning(f'Falha ao buscar página {p}: {e}')
+                progress.progress(p / max_pages); continue
+            rows = extrair_anuncios(html)
+            all_rows.extend(rows)
+            time.sleep(0.6)
+            progress.progress(p / max_pages)
+        with st.expander('Links diretos das páginas de busca geradas'):
+            for u in search_links:
+                st.markdown(f'- {u}')
+        if not all_rows:
+            st.error('Nenhum anúncio coletado. A OLX pode estar limitando acessos do servidor.\n'
+                     'Abra os links acima no navegador **ou** use a aba "Importar HTML".')
+        else:
+            st.session_state['rows_online'] = all_rows
+
+# ---------------------------
+# TAB 2 — Importar HTML (manual, sem 403)
+# ---------------------------
+with tab_import:
+    st.write('Abra a busca no seu **navegador**, ajuste filtros e role a página para carregar os anúncios. '
+             'Depois **Ctrl+S → "Página da Web, somente HTML"** (.html). Faça isso para **1 ou mais páginas** (&o=2, &o=3...). '
+             'Envie os arquivos abaixo.')
+    files = st.file_uploader('Envie um ou mais arquivos .html das páginas da OLX', type=['html', 'htm'], accept_multiple_files=True)
+    if files and st.button('📥 Importar anúncios dos HTMLs'):
+        imported = []
+        for f in files:
+            try:
+                data = f.read()
+                try:
+                    html = data.decode('utf-8', errors='ignore')
+                except Exception:
+                    html = data.decode('latin-1', errors='ignore')
+                rows = extrair_anuncios(html)
+                imported.extend(rows)
+            except Exception as e:
+                st.warning(f'Falha ao ler {f.name}: {e}')
+        if not imported:
+            st.error('Não foi possível extrair anúncios dos arquivos enviados.\n'
+                     'Dicas: 1) role a página até o fim antes de salvar; 2) salve como "somente HTML"; '
+                     '3) verifique se os arquivos têm > 500 KB; 4) tente também salvar a página 2 (&o=2).')
+        else:
+            st.success(f'Importados {len(imported)} anúncios a partir de {len(files)} arquivo(s).')
+            st.session_state['rows_online'] = imported
+
+# ---------------------------
+# PÓS-COLETA (comum aos dois modos)
+# ---------------------------
+rows = st.session_state.get('rows_online', [])
+if rows:
+    df = pd.DataFrame(rows).drop_duplicates(subset=['url'])
+    for col in ['titulo', 'preco_txt', 'preco_num', 'url']:
+        if col not in df.columns: df[col] = None
+
+    # reforça a faixa de preço
+    min_p = max(0, int(budget - tol_preco)); max_p = int(budget + tol_preco)
+    if only_with_price: df = df[df['preco_num'].notna()]
+    df = df[(df['preco_num'].notna()) & (df['preco_num'].between(min_p, max_p))]
+
+    if df.empty:
+        st.info('Nenhum anúncio na faixa de preço após filtros.')
+    else:
+        # Estima FIPE
+        st.info('Estimando FIPE por título/ano (heurística, pode levar alguns segundos)...')
+        fipe_vals = []
+        for t in df['titulo'].fillna('').tolist():
+            try:
+                fipe_val = estimate_fipe_from_title(t)
+            except Exception:
+                fipe_val = None
+            fipe_vals.append(fipe_val); time.sleep(0.15)
+        df['fipe_estimado'] = fipe_vals
+
+        # Calcula margem
+        df['margem_calc'] = df.apply(
+            lambda r: (r['fipe_estimado'] - r['preco_num']) if pd.notna(r['fipe_estimado']) and pd.notna(r['preco_num']) else None,
+            axis=1
+        )
+
+        # Seleção pela margem ~ alvo
+        alvo_min = margem_alvo - tol_margem; alvo_max = margem_alvo + tol_margem
+        mask_margem = df['margem_calc'].notna() & df['margem_calc'].between(alvo_min, alvo_max)
+        df_sel = df[mask_margem].copy()
+
+        if df_sel.empty:
+            st.warning('Nenhum anúncio dentro da faixa de margem; exibindo anúncios com FIPE estimada para avaliação.')
+            df_sel = df[df['fipe_estimado'].notna()].copy()
+
+        if df_sel.empty:
+            st.info('Sem FIPE estimada suficiente para cálculo de margem.')
+        else:
+            df_sel['delta_margem'] = (df_sel['margem_calc'] - margem_alvo).abs()
+            df_sel['delta_preco'] = (df_sel['preco_num'] - budget).abs()
+            df_sel = df_sel.sort_values(['delta_margem', 'delta_preco']).reset_index(drop=True)
+
+            df_show = df_sel[['titulo', 'preco_num', 'fipe_estimado', 'margem_calc', 'url']].copy()
+            df_show.rename(columns={
+                'titulo': 'Título', 'preco_num': 'Preço (R$)',
+                'fipe_estimado': 'FIPE estimada (R$)', 'margem_calc': 'Margem (FIPE − Preço)', 'url': 'Anúncio',
+            }, inplace=True)
+
+            def fmt_money(v):
+                if v is None: return '—'
+                return ('R$ {:,.2f}'.format(v)).replace(',', 'X').replace('.', ',').replace('X', '.')
+            df_show['Preço (R$)'] = df_show['Preço (R$)'].apply(fmt_money)
+            df_show['FIPE estimada (R$)'] = df_show['FIPE estimada (R$)'].apply(fmt_money)
+            df_show['Margem (FIPE − Preço)'] = df_show['Margem (FIPE − Preço)'].apply(fmt_money)
+
+            colcfg = {}
+            try: colcfg['Anúncio'] = st.column_config.LinkColumn('Anúncio')
+            except Exception: pass
+
+            st.subheader(f'Resultados ({len(df_show)})')
+            st.dataframe(df_show, use_container_width=True, column_config=colcfg, hide_index=True)
+
+            # CSV com valores numéricos crus
+            out = df_sel[['titulo', 'preco_num', 'fipe_estimado', 'margem_calc', 'url']].copy()
+            csv_io = StringIO(); writer = csv.writer(csv_io, delimiter=';')
+            writer.writerow(['titulo', 'preco_num', 'fipe_estimado', 'margem_calc', 'url'])
+            for _, r in out.iterrows():
+                writer.writerow([
+                    r.get('titulo', ''), r.get('preco_num', ''), r.get('fipe_estimado', ''), r.get('margem_calc', ''), r.get('url', '')
+                ])
+            st.download_button('⬇️ Baixar CSV (valores numéricos)', data=csv_io.getvalue().encode('utf-8'),
+                               file_name='olx_busca_orcamento_margem.csv', mime='text/csv')
