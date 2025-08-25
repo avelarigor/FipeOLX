@@ -1,13 +1,12 @@
 # -*- coding: utf-8 -*-
-# OLX x FIPE — v5.4
-# - Orçamento + margem alvo (com tolerâncias)
-# - Modelo/Estado/Cidade opcionais
+# OLX x FIPE — v5.5 (orçamento + margem; modelo/estado/cidade opcionais; robusto com depuração)
 # - 3 modos contra 403:
 #     * Provedores via st.secrets (SCRAPERAPI_KEY / SCRAPINGBEE_KEY)
-#     * Importar HTML (robusto: links relativos, múltiplos seletores, preço por regex no card)
+#     * Importar HTML (tolerante: links relativos, vários seletores, regex no pai/vizinhos)
 #     * Rodar localmente
 # - Estimativa de FIPE (API Parallelum) por heurística (título/ano)
 # - Ranking por proximidade de margem e de preço
+# - Expander "Depuração" mostra quantos elementos achou e primeiras amostras
 
 import re
 import csv
@@ -46,9 +45,6 @@ with st.sidebar:
                           help='Quantidade de páginas (parâmetro &o=)')
     only_with_price = st.checkbox('Apenas anúncios com preço', value=True)
 
-# ---------------------------
-# Modo de operação
-# ---------------------------
 tab_busca, tab_import = st.tabs(['Buscar online (automático)', 'Importar HTML (manual, sem 403)'])
 
 # ---------------------------
@@ -69,10 +65,13 @@ BASE_HDRS = {
 }
 BASE_URL = 'https://www.olx.com.br'
 
+PRICE_RE = re.compile(r'R\$\s*[\d\.\s]+(?:,\d{2})?')
+
 def parse_preco(texto: str):
     if not texto:
         return None
-    t = texto.replace('.', '').replace(',', '')
+    # aceita "R$ 30.000", "30.000", "30 000"
+    t = texto.replace('R$', '').replace(' ', '').replace('.', '').replace(',', '')
     nums = re.findall(r'\d+', t)
     if not nums:
         return None
@@ -87,92 +86,104 @@ def _text(node):
     except Exception:
         return ""
 
+def _first(*candidates):
+    for x in candidates:
+        if x:
+            return x
+    return None
+
+def _find_price_near(node):
+    """tenta achar 'R$ ...' no próprio node, nos filhos, pais e vizinhos próximos"""
+    # 1) no próprio node/filhos
+    t = _text(node)
+    m = PRICE_RE.search(t)
+    if m:
+        return m.group(0)
+
+    # 2) pais (até 3 níveis)
+    p = node.parent
+    for _ in range(3):
+        if not p:
+            break
+        m = PRICE_RE.search(_text(p))
+        if m:
+            return m.group(0)
+        p = p.parent
+
+    # 3) irmãos próximos
+    sib = getattr(node, 'next_sibling', None)
+    for _ in range(3):
+        if not sib:
+            break
+        m = PRICE_RE.search(_text(sib))
+        if m:
+            return m.group(0)
+        sib = getattr(sib, 'next_sibling', None)
+
+    return None
+
 def extrair_anuncios(html: str):
-    """Extrai {titulo, preco_txt, preco_num, url} com alto grau de tolerância."""
+    """Extrai {titulo, preco_txt, preco_num, url} com alta tolerância e logs."""
     soup = BeautifulSoup(html, 'html.parser')
     results = []
 
-    # 1) Seletores mais comuns (cards)
-    card_selectors = [
+    # Seletores razoavelmente estáveis
+    anchors = []
+    selectors = [
         'a[data-ds-component="DS-AdCard"]',
         'a[data-testid*="ad-card"]',
-        'a.sc-.*[href*="/d/"]',  # classes geradas
         'a[href*="/d/"]',
     ]
-    anchors = []
-    for sel in card_selectors:
+    for sel in selectors:
         try:
             anchors.extend(soup.select(sel))
         except Exception:
-            # seletor CSS inválido (regex-like) — ignore
             pass
 
-    # Dedup de anchors
-    seen_a = set()
-    uniq_anchors = []
+    # Dedup anchors
+    seen_a, uniq_anchors = set(), []
     for a in anchors:
         href = a.get('href')
-        if not href:
-            continue
-        if href in seen_a:
+        if not href or href in seen_a:
             continue
         seen_a.add(href)
         uniq_anchors.append(a)
 
+    # Coleta a partir dos anchors
     for a in uniq_anchors:
         href = a.get('href')
-        url = urljoin(BASE_URL, href)  # normaliza relativos -> absolutos
+        url = urljoin(BASE_URL, href)
         if 'olx.com.br' not in url:
             continue
 
-        # Título (prioriza atributo title, depois h2/h3, depois texto do link)
-        titulo = a.get('title')
+        # título
+        titulo = _first(a.get('title'), _text(a.find('h2')), _text(a.find('h3')), _text(a))
         if not titulo:
-            h = a.find('h2') or a.find('h3')
-            if h:
-                titulo = _text(h)
-        if not titulo:
-            titulo = _text(a)
-        if not titulo:
-            # tenta subir 1..2 níveis e pegar um heading
+            # sobe 1-2 níveis e tenta um heading
             p = a.parent
             for _ in range(2):
                 if not p:
                     break
-                h = p.find('h2') or p.find('h3')
-                if h:
-                    titulo = _text(h)
+                titulo = _first(_text(p.find('h2')), _text(p.find('h3')))
+                if titulo:
                     break
                 p = p.parent
 
-        # Preço — tenta vários lugares e, por fim, regex no texto do card/pai
+        # preço (vários caminhos)
         preco_txt = None
-        # 1) elementos "clássicos"
+        # explícitos
         for el in [
             a.find(attrs={'data-ds-component': 'DS-Price'}),
-            a.find('span', string=re.compile(r'R\$\s*[\d\.\,]+')),
-            a.find('p', string=re.compile(r'R\$\s*[\d\.\,]+')),
-            a.find('h3', string=re.compile(r'R\$\s*[\d\.\,]+')),
+            a.find('span', string=PRICE_RE),
+            a.find('p', string=PRICE_RE),
+            a.find('h3', string=PRICE_RE),
         ]:
             if el:
                 preco_txt = _text(el)
                 break
-        # 2) busca no texto do link
+        # regex no próprio card/pai/irmãos
         if not preco_txt:
-            m = re.search(r'R\$\s*[\d\.\,]+', _text(a))
-            if m:
-                preco_txt = m.group(0)
-        # 3) busca no texto do pai (1..2 níveis)
-        if not preco_txt:
-            p = a.parent
-            for _ in range(2):
-                if not p:
-                    break
-                m = re.search(r'R\$\s*[\d\.\,]+', _text(p))
-                if m:
-                    preco_txt = m.group(0)
-                    break
-                p = p.parent
+            preco_txt = _find_price_near(a)
 
         results.append({
             'titulo': titulo.strip() if titulo else None,
@@ -181,35 +192,32 @@ def extrair_anuncios(html: str):
             'url': url
         })
 
-    # 2) Se nada foi capturado pelos anchors, tenta qualquer link para /d/ no documento
+    # fallback extremo: varre todos os <a href="/d/...">
     if not results:
         for a in soup.find_all('a', href=True):
             href = a['href']
             if '/d/' not in href:
                 continue
             url = urljoin(BASE_URL, href)
-            titulo = a.get('title') or _text(a)
-            m = re.search(r'R\$\s*[\d\.\,]+', _text(a) + " " + _text(a.parent) if a.parent else "")
-            preco_txt = m.group(0) if m else None
+            titulo = _first(a.get('title'), _text(a))
+            preco_txt = _find_price_near(a)
             results.append({
-                'titulo': titulo.strip() if titulo else None,
+                'titulo': (titulo or '').strip() or None,
                 'preco_txt': preco_txt,
                 'preco_num': parse_preco(preco_txt),
                 'url': url
             })
 
-    # Dedup por URL
-    clean = []
-    seen = set()
+    # Dedup e limpeza mínima
+    clean, seen = [], set()
     for r in results:
         u = r.get('url')
         if not u or u in seen:
             continue
         seen.add(u)
-        # precisa pelo menos título ou preço
         if r.get('titulo') or r.get('preco_txt'):
             clean.append(r)
-    return clean
+    return clean, len(uniq_anchors)
 
 def montar_url(budget: float, tol_preco_val: float, modelo: str = '', estado: str = None, cidade: str = None, page: int = 1):
     base = f'{BASE_URL}/autos-e-pecas/carros-vans-e-utilitarios'
@@ -230,7 +238,6 @@ def montar_url(budget: float, tol_preco_val: float, modelo: str = '', estado: st
     return base + path + params
 
 def _call_scraping_provider(url: str, headers: dict):
-    """Se houver chaves em st.secrets, usa ScraperAPI ou ScrapingBee para contornar 403."""
     providers = []
     key_scraperapi = st.secrets.get('SCRAPERAPI_KEY', None)
     key_scrapingbee = st.secrets.get('SCRAPINGBEE_KEY', None)
@@ -346,7 +353,6 @@ def estimate_fipe_from_title(title: str):
         try: years = get_years(brand['codigo'], mdl['codigo'])
         except Exception: continue
         if not years: continue
-        # escolhe ano mais próximo (se detectou), senão o primeiro
         year_choice = None
         if year_num:
             def year_of(code_name: str):
@@ -385,6 +391,7 @@ st.markdown(f'🔗 **Página base da OLX (página 1):** [{base_url}]({base_url})
 # ---------------------------
 with tab_busca:
     if st.button('🔎 Buscar anúncios (online)'):
+        st.session_state['rows_online'] = []
         all_rows = []
         progress = st.progress(0.0, text='Coletando páginas...')
         log = st.empty()
@@ -398,29 +405,34 @@ with tab_busca:
             except Exception as e:
                 st.warning(f'Falha ao buscar página {p}: {e}')
                 progress.progress(p / max_pages); continue
-            rows = extrair_anuncios(html)
+            rows, anchor_count = extrair_anuncios(html)
             all_rows.extend(rows)
             time.sleep(0.6)
             progress.progress(p / max_pages)
+
         with st.expander('Links diretos das páginas de busca geradas'):
             for u in search_links:
                 st.markdown(f'- {u}')
+
         if not all_rows:
             st.error('Nenhum anúncio coletado. A OLX pode estar limitando acessos do servidor.\n'
                      'Abra os links acima no navegador **ou** use a aba "Importar HTML".')
         else:
+            st.success(f'Coletados {len(all_rows)} anúncios.')
             st.session_state['rows_online'] = all_rows
 
 # ---------------------------
 # TAB 2 — Importar HTML (manual, sem 403)
 # ---------------------------
 with tab_import:
-    st.write('Abra a busca no seu **navegador**, ajuste filtros e role a página para carregar os anúncios. '
-             'Depois **Ctrl+S → "Página da Web, somente HTML"** (.html). Faça isso para **1 ou mais páginas** (&o=2, &o=3...). '
+    st.write('Abra a busca no seu **navegador**, ajuste filtros e role a página até o fim. '
+             'Depois **Ctrl+S → "Página da Web, somente HTML"** (.html). Faça isso para **1+ páginas** (&o=2, &o=3...). '
              'Envie os arquivos abaixo.')
     files = st.file_uploader('Envie um ou mais arquivos .html das páginas da OLX', type=['html', 'htm'], accept_multiple_files=True)
     if files and st.button('📥 Importar anúncios dos HTMLs'):
+        st.session_state['rows_online'] = []
         imported = []
+        debug_samples = []
         for f in files:
             try:
                 data = f.read()
@@ -428,17 +440,23 @@ with tab_import:
                     html = data.decode('utf-8', errors='ignore')
                 except Exception:
                     html = data.decode('latin-1', errors='ignore')
-                rows = extrair_anuncios(html)
+                rows, anchor_count = extrair_anuncios(html)
                 imported.extend(rows)
+                # guarda amostras de depuração
+                for r in rows[:3]:
+                    debug_samples.append((f.name, r.get('titulo'), r.get('preco_txt'), r.get('url')))
+                st.info(f'{f.name}: {len(rows)} anúncios extraídos (anchors detectados: {anchor_count}).')
             except Exception as e:
                 st.warning(f'Falha ao ler {f.name}: {e}')
         if not imported:
-            st.error('Não foi possível extrair anúncios dos arquivos enviados.\n'
-                     'Dicas: 1) role a página até o fim antes de salvar; 2) salve como "somente HTML"; '
-                     '3) verifique se os arquivos têm > 500 KB; 4) tente também salvar a página 2 (&o=2).')
+            st.error('Não foi possível extrair anúncios. Dicas: 1) role a página até o fim antes de salvar; '
+                     '2) salve como "somente HTML"; 3) o arquivo deve ter > 500 KB; 4) tente também a página 2 (&o=2).')
         else:
             st.success(f'Importados {len(imported)} anúncios a partir de {len(files)} arquivo(s).')
             st.session_state['rows_online'] = imported
+            with st.expander('Depuração — primeiras amostras extraídas'):
+                for i, (fname, t, p, u) in enumerate(debug_samples[:10], 1):
+                    st.write(f'{i}. [{fname}] título="{t}" | preço="{p}" | url="{u}"')
 
 # ---------------------------
 # PÓS-COLETA (comum aos dois modos)
@@ -457,7 +475,6 @@ if rows:
     if df.empty:
         st.info('Nenhum anúncio na faixa de preço após filtros.')
     else:
-        # Estima FIPE
         st.info('Estimando FIPE por título/ano (heurística, pode levar alguns segundos)...')
         fipe_vals = []
         for t in df['titulo'].fillna('').tolist():
@@ -465,7 +482,7 @@ if rows:
                 fipe_val = estimate_fipe_from_title(t)
             except Exception:
                 fipe_val = None
-            fipe_vals.append(fipe_val); time.sleep(0.15)
+            fipe_vals.append(fipe_val); time.sleep(0.12)
         df['fipe_estimado'] = fipe_vals
 
         # Calcula margem
